@@ -37,7 +37,7 @@ if [[ ${VER} == *"dev"* ]]; then
     git reset --hard
 
 else
-    python setup.py sdist upload -r pypitest
+    python setup.py sdist
     # Reset the commit, we don't want versions in the commit
     git commit -a -m "Updated to version ${VER}"
 
