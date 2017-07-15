@@ -69,14 +69,14 @@ Once you've wrapped your task with the `DeferrableTask`-class decorator, you'll 
 
 So what of this subclass of Twisted's `Deferred`?  It can be thought of as a `Deferred` that also gives transparent access to all the attributes and methods of it's associated `AsyncResult` instance.  It can be thought of in those terms because that's *exactly what it is*, and that's why this part of the API only constitutes half of a thing to learn.
 
-Our subclass is called `DeferredTask`, it lives in `txcelery.defer` and as far as Twisted is concerned it's just a plain old `Deferred`.  DeferredTasks can be chained, passed to `maybeDeferred`, joined via `gatherResults` and `DeferredList`, etc.
+Our subclass is called `_DeferredTask`, it lives in `txcelery.defer` and as far as Twisted is concerned it's just a plain old `Deferred`.  DeferredTasks can be chained, passed to `maybeDeferred`, joined via `gatherResults` and `DeferredList`, etc.
 
-`DeferredTask` monitors the state of the task and fires with a callback if the task succeeds, or with an errback if the task fails.  If the task is revoked, `DeferredTask` fires with an errback containing a `twisted.defer.CancelledError` as it's `Failure` value.
+`_DeferredTask` monitors the state of the task and fires with a callback if the task succeeds, or with an errback if the task fails.  If the task is revoked, `_DeferredTask` fires with an errback containing a `twisted.defer.CancelledError` as it's `Failure` value.
 
 ###In summary
 
 1.  Wrap a task with a `DeferrableTask`
-2.  Call task methods and obtain a `DeferredTask` instance in lieu of an `AsyncResult`
-3.  Use `DeferredTask` as if it were a regular `Deferred` or a regular `AsyncResult`
+2.  Call task methods and obtain a `_DeferredTask` instance in lieu of an `AsyncResult`
+3.  Use `_DeferredTask` as if it were a regular `Deferred` or a regular `AsyncResult`
 
 And that's *really* all there is to it.

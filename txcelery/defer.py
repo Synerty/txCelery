@@ -12,6 +12,7 @@ from builtins import ValueError
 from functools import wraps
 from types import MethodType, FunctionType
 
+from celery import __version__ as celeryVersion
 from celery import states
 from celery.local import PromiseProxy
 from celery.result import AsyncResult
@@ -19,13 +20,14 @@ from celery.worker.control import revoke
 from twisted.internet import defer, reactor
 from twisted.python.failure import Failure
 
+isCeleryV4 = celeryVersion.startswith("4.")
 
-class DeferredTask(defer.Deferred):
+class _DeferredTask(defer.Deferred):
     """Subclass of `twisted.defer.Deferred` that wraps a
     `celery.local.PromiseProxy` (i.e. a "Celery task"), exposing the combined
     functionality of both classes.
 
-    `DeferredTask` instances can be treated both like ordinary Deferreds and
+    `_DeferredTask` instances can be treated both like ordinary Deferreds and
     oridnary PromiseProxies.
     """
 
@@ -33,15 +35,20 @@ class DeferredTask(defer.Deferred):
     POLL_PERIOD = 0.05
 
     def __init__(self, async_result):
-        """Instantiate a `DeferredTask`.  See `help(DeferredTask)` for details
+        """Instantiate a `_DeferredTask`.  See `help(_DeferredTask)` for details
         pertaining to functionality.
 
         :param async_result : celery.result.AsyncResult
             AsyncResult to be monitored.  When completed or failed, the
-            DeferredTask will callback or errback, respectively.
+            _DeferredTask will callback or errback, respectively.
         """
+
+        if isinstance(async_result, PromiseProxy):
+            raise TypeError('Decarate with "DeferrableTask, not "_DeferredTask".')
+
+
         # Deferred is an old-style class
-        defer.Deferred.__init__(self, DeferredTask._canceller)
+        defer.Deferred.__init__(self, _DeferredTask._canceller)
 
         self.task = async_result
         self._monitor_task()
@@ -74,7 +81,7 @@ class DeferredTask(defer.Deferred):
 class DeferrableTask:
     """Decorator class that wraps a celery task such that any methods
     returning an Celery `AsyncResult` instance are wrapped in a
-    `DeferredTask` instance.
+    `_DeferredTask` instance.
 
     Instances of `DeferrableTask` expose all methods of the underlying Celery
     task.
@@ -92,7 +99,7 @@ class DeferrableTask:
     """
 
     def __init__(self, fn):
-        if not isinstance(fn, PromiseProxy):
+        if isCeleryV4 and not isinstance(fn, PromiseProxy):
             raise TypeError('Wrapped function must be a Celery task.')
 
         self._fn = fn
@@ -116,7 +123,7 @@ class DeferrableTask:
         def wrapper(*args, **kw):
             res = method(*args, **kw)
             if isinstance(res, AsyncResult):
-                return DeferredTask(res)
+                return _DeferredTask(res)
             return res
 
         return wrapper
@@ -126,4 +133,4 @@ class DeferrableTask:
 class CeleryClient(DeferrableTask):
     pass
 
-__all__ = [CeleryClient, DeferredTask, DeferrableTask]
+__all__ = [CeleryClient, _DeferredTask, DeferrableTask]
