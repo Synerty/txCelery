@@ -17,8 +17,12 @@ from celery import states
 from celery.local import PromiseProxy
 from celery.result import AsyncResult
 from celery.worker.control import revoke
+
+import twisted
 from twisted.internet import defer, reactor
 from twisted.python.failure import Failure
+
+from twisted.internet.threads import deferToThread
 
 isCeleryV4 = celeryVersion.startswith("4.")
 
@@ -57,25 +61,45 @@ class _DeferredTask(defer.Deferred):
         revoke(self.task.id, terminate=True)
 
     def _monitor_task(self):
-        """Wrapper that handles the actual asynchronous monitoring of the task
-        state.
+        """ Monitor Task
+
+        Periodically check on the progress of the celery task.
+
+        """
+        def _cb(arg):
+            finished, result = arg
+            if finished:
+                return self.callback(result)
+
+            reactor.callLater(self.POLL_PERIOD, self._monitor_task)
+
+        d = deferToThread(self._monitor_task_in_thread)
+        d.addCallback(_cb)
+        d.addErrback(self.errback) # Chain the errback
+
+    def _monitor_task_in_thread(self):
+        """ Monitor Task In Thread
+
+        The Celery task state must be checked in a thread, otherwise it blocks.
+
+        This may stuff with Celerys connection to the result backend.
+        I'm not sure how it manages that.
 
         """
         if self.task.state in states.UNREADY_STATES:
-            reactor.callLater(self.POLL_PERIOD, self._monitor_task)
-            return
+            return False, None
 
         if self.task.state == 'SUCCESS':
-            self.callback(self.task.result)
+            return True, self.task.result
+
         elif self.task.state == 'FAILURE':
-            self.errback(Failure(self.task.result))
+            raise self.task.result
+
         elif self.task.state == 'REVOKED':
-            self.errback(
-                Failure(defer.CancelledError('Task {0}'.format(self.task.id))))
+            raise defer.CancelledError('Task %s' % self.task.id)
+
         else:
-            self.errback(ValueError(
-                'Cannot respond to `{}` state'.format(self.task.state)
-            ))
+            raise ValueError('Cannot respond to `%s` state' % self.task.state)
 
 
 class DeferrableTask:
@@ -93,7 +117,9 @@ class DeferrableTask:
         def my_task():
             # ...
 
-    :Note:  The `@DeferrableTask` decorator must be callsed __after__ the
+    :Note:  The `@DeferrableTask` decorator must be the __top_most__ decorator.
+
+            The `@DeferrableTask` decorator must be called __after__ the
            `@app.task` decorator, meaning that the former must be __above__
            the latter.
     """
@@ -117,14 +143,23 @@ class DeferrableTask:
             return self._wrap(attr)
         return attr
 
+
     @staticmethod
     def _wrap(method):
         @wraps(method)
         def wrapper(*args, **kw):
-            res = method(*args, **kw)
-            if isinstance(res, AsyncResult):
-                return _DeferredTask(res)
-            return res
+            if not twisted.python.threadable.isInIOThread():
+                raise Exception(
+                    "txCelery methods can only be called from the reactors main thread")
+
+            def _cb(res):
+                if isinstance(res, AsyncResult):
+                    return _DeferredTask(res)
+                return res
+
+            d = deferToThread(method, *args, **kw)
+            d.addCallback(_cb)
+            return d
 
         return wrapper
 
