@@ -3,7 +3,7 @@ from setuptools import setup
 
 
 package_name = 'txcelery-py3'
-package_version = '1.2.2'
+package_version = '1.3.0'
 
 setup(
     name='txcelery-py3',
