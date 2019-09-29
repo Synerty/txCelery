@@ -95,9 +95,21 @@ class _DeferredTask(defer.Deferred):
                 return False, None
 
             result = self.task.result
+            self.task.forget()
 
-        except redis.exceptions.ConnectionError as e:
             # Ignore connection errors, it will retry on the next loop
+
+        except redis.exceptions.ConnectionError:
+            # redis.exceptions.ConnectionError:
+            # Error 32 while writing to socket. Broken pipe.
+            return False, None
+
+        except AttributeError:
+            # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
+            return False, None
+
+        except RuntimeError:
+            # builtins.RuntimeError: dictionary changed size during iteration
             return False, None
 
         if state == 'SUCCESS':
@@ -172,8 +184,19 @@ class DeferrableTask:
                     try:
                         return method(*args, **kwargs)
 
-                    except redis.exceptions.ConnectionError as e:
-                        logger.debug("Retrying Async task due to redis error, %s", str(e))
+                    except redis.exceptions.ConnectionError:
+                        # redis.exceptions.ConnectionError:
+                        # Error 32 while writing to socket. Broken pipe.
+                        logger.debug("Retrying Async task due to redis error")
+
+                    except RuntimeError:
+                        # builtins.RuntimeError: dictionary changed size during iteration
+                        logger.debug("Retrying Async task due to redis error")
+
+                    except AttributeError:
+                        # builtins.AttributeError:
+                        # 'NoneType' object has no attribute 'sendall'
+                        logger.debug("Retrying Async task due to redis error")
 
             d = deferToThread(_retriedMethod, *args, **kw)
             d.addCallback(_cb)
