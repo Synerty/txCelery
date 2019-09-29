@@ -7,24 +7,26 @@ Module Contents:
     - DeferredTask
     - CeleryClient
 """
+import logging
 from builtins import ValueError
-
 from functools import wraps
 from types import MethodType, FunctionType
 
+import redis
+import twisted
 from celery import __version__ as celeryVersion
 from celery import states
 from celery.local import PromiseProxy
 from celery.result import AsyncResult
 from celery.worker.control import revoke
-
-import twisted
 from twisted.internet import defer, reactor
+from twisted.internet.threads import deferToThread
 from twisted.python.failure import Failure
 
-from twisted.internet.threads import deferToThread
-
 isCeleryV4 = celeryVersion.startswith("4.")
+
+logger = logging.getLogger(__name__)
+
 
 class _DeferredTask(defer.Deferred):
     """Subclass of `twisted.defer.Deferred` that wraps a
@@ -50,7 +52,6 @@ class _DeferredTask(defer.Deferred):
         if isinstance(async_result, PromiseProxy):
             raise TypeError('Decarate with "DeferrableTask, not "_DeferredTask".')
 
-
         # Deferred is an old-style class
         defer.Deferred.__init__(self, _DeferredTask._canceller)
 
@@ -66,6 +67,7 @@ class _DeferredTask(defer.Deferred):
         Periodically check on the progress of the celery task.
 
         """
+
         def _cb(arg):
             finished, result = arg
             if finished:
@@ -75,7 +77,7 @@ class _DeferredTask(defer.Deferred):
 
         d = deferToThread(self._monitor_task_in_thread)
         d.addCallback(_cb)
-        d.addErrback(self.errback) # Chain the errback
+        d.addErrback(self.errback)  # Chain the errback
 
     def _monitor_task_in_thread(self):
         """ Monitor Task In Thread
@@ -86,20 +88,29 @@ class _DeferredTask(defer.Deferred):
         I'm not sure how it manages that.
 
         """
-        if self.task.state in states.UNREADY_STATES:
+        try:
+            state = self.task.state
+
+            if state in states.UNREADY_STATES:
+                return False, None
+
+            result = self.task.result
+
+        except redis.exceptions.ConnectionError as e:
+            # Ignore connection errors, it will retry on the next loop
             return False, None
 
-        if self.task.state == 'SUCCESS':
-            return True, self.task.result
+        if state == 'SUCCESS':
+            return True, result
 
-        elif self.task.state == 'FAILURE':
-            raise self.task.result
+        elif state == 'FAILURE':
+            raise result
 
-        elif self.task.state == 'REVOKED':
+        elif state == 'REVOKED':
             raise defer.CancelledError('Task %s' % self.task.id)
 
         else:
-            raise ValueError('Cannot respond to `%s` state' % self.task.state)
+            raise ValueError('Cannot respond to `%s` state' % state)
 
 
 class DeferrableTask:
@@ -143,7 +154,6 @@ class DeferrableTask:
             return self._wrap(attr)
         return attr
 
-
     @staticmethod
     def _wrap(method):
         @wraps(method)
@@ -157,7 +167,15 @@ class DeferrableTask:
                     return _DeferredTask(res)
                 return res
 
-            d = deferToThread(method, *args, **kw)
+            def _retriedMethod(*args, **kwargs):
+                while True:
+                    try:
+                        return method(*args, **kwargs)
+
+                    except redis.exceptions.ConnectionError as e:
+                        logger.debug("Retrying Async task due to redis error, %s", str(e))
+
+            d = deferToThread(_retriedMethod, *args, **kw)
             d.addCallback(_cb)
             return d
 
@@ -167,5 +185,6 @@ class DeferrableTask:
 # Backwards compatibility
 class CeleryClient(DeferrableTask):
     pass
+
 
 __all__ = [CeleryClient, _DeferredTask, DeferrableTask]
