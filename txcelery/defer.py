@@ -26,6 +26,7 @@ from twisted.internet.threads import deferToThread
 
 isCeleryV4 = celeryVersion.startswith("4.")
 
+
 class _DeferredTask(defer.Deferred):
     """Subclass of `twisted.defer.Deferred` that wraps a
     `celery.local.PromiseProxy` (i.e. a "Celery task"), exposing the combined
@@ -48,17 +49,23 @@ class _DeferredTask(defer.Deferred):
         """
 
         if isinstance(async_result, PromiseProxy):
-            raise TypeError('Decarate with "DeferrableTask, not "_DeferredTask".')
-
+            raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
 
         # Deferred is an old-style class
         defer.Deferred.__init__(self, _DeferredTask._canceller)
+        self.addErrback(self._cbErrback)
 
         self.task = async_result
         self._monitor_task()
 
-    def _canceller(self):
+    def _canceller(self, *args):
         revoke(self.task.id, terminate=True)
+
+    def _cbErrback(self, failure: Failure) -> Failure:
+        if isinstance(failure.value, TimeoutError):
+            self._canceller()
+
+        return failure
 
     def _monitor_task(self):
         """ Monitor Task
@@ -66,7 +73,11 @@ class _DeferredTask(defer.Deferred):
         Periodically check on the progress of the celery task.
 
         """
+
         def _cb(arg):
+            if self.called:
+                return
+
             finished, result = arg
             if finished:
                 return self.callback(result)
@@ -75,7 +86,7 @@ class _DeferredTask(defer.Deferred):
 
         d = deferToThread(self._monitor_task_in_thread)
         d.addCallback(_cb)
-        d.addErrback(self.errback) # Chain the errback
+        d.addErrback(self.errback)  # Chain the errback
 
     def _monitor_task_in_thread(self):
         """ Monitor Task In Thread
@@ -143,7 +154,6 @@ class DeferrableTask:
             return self._wrap(attr)
         return attr
 
-
     @staticmethod
     def _wrap(method):
         @wraps(method)
@@ -167,5 +177,6 @@ class DeferrableTask:
 # Backwards compatibility
 class CeleryClient(DeferrableTask):
     pass
+
 
 __all__ = [CeleryClient, _DeferredTask, DeferrableTask]
