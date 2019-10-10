@@ -7,24 +7,25 @@ Module Contents:
     - DeferredTask
     - CeleryClient
 """
+import logging
 from builtins import ValueError
-
 from functools import wraps
 from types import MethodType, FunctionType
 
+import redis
+import twisted
 from celery import __version__ as celeryVersion
 from celery import states
 from celery.local import PromiseProxy
 from celery.result import AsyncResult
 from celery.worker.control import revoke
-
-import twisted
 from twisted.internet import defer, reactor
+from twisted.internet.threads import deferToThread
 from twisted.python.failure import Failure
 
-from twisted.internet.threads import deferToThread
-
 isCeleryV4 = celeryVersion.startswith("4.")
+
+logger = logging.getLogger(__name__)
 
 
 class _DeferredTask(defer.Deferred):
@@ -73,7 +74,6 @@ class _DeferredTask(defer.Deferred):
         Periodically check on the progress of the celery task.
 
         """
-
         def _cb(arg):
             if self.called:
                 return
@@ -97,20 +97,41 @@ class _DeferredTask(defer.Deferred):
         I'm not sure how it manages that.
 
         """
-        if self.task.state in states.UNREADY_STATES:
+        try:
+            state = self.task.state
+
+            if state in states.UNREADY_STATES:
+                return False, None
+
+            result = self.task.result
+            self.task.forget()
+
+            # Ignore connection errors, it will retry on the next loop
+
+        except redis.exceptions.ConnectionError:
+            # redis.exceptions.ConnectionError:
+            # Error 32 while writing to socket. Broken pipe.
             return False, None
 
-        if self.task.state == 'SUCCESS':
-            return True, self.task.result
+        except AttributeError:
+            # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
+            return False, None
 
-        elif self.task.state == 'FAILURE':
-            raise self.task.result
+        except RuntimeError:
+            # builtins.RuntimeError: dictionary changed size during iteration
+            return False, None
 
-        elif self.task.state == 'REVOKED':
+        if state == 'SUCCESS':
+            return True, result
+
+        elif state == 'FAILURE':
+            raise result
+
+        elif state == 'REVOKED':
             raise defer.CancelledError('Task %s' % self.task.id)
 
         else:
-            raise ValueError('Cannot respond to `%s` state' % self.task.state)
+            raise ValueError('Cannot respond to `%s` state' % state)
 
 
 class DeferrableTask:
@@ -167,7 +188,26 @@ class DeferrableTask:
                     return _DeferredTask(res)
                 return res
 
-            d = deferToThread(method, *args, **kw)
+            def _retriedMethod(*args, **kwargs):
+                while True:
+                    try:
+                        return method(*args, **kwargs)
+
+                    except redis.exceptions.ConnectionError:
+                        # redis.exceptions.ConnectionError:
+                        # Error 32 while writing to socket. Broken pipe.
+                        logger.debug("Retrying Async task due to redis error")
+
+                    except RuntimeError:
+                        # builtins.RuntimeError: dictionary changed size during iteration
+                        logger.debug("Retrying Async task due to redis error")
+
+                    except AttributeError:
+                        # builtins.AttributeError:
+                        # 'NoneType' object has no attribute 'sendall'
+                        logger.debug("Retrying Async task due to redis error")
+
+            d = deferToThread(_retriedMethod, *args, **kw)
             d.addCallback(_cb)
             return d
 
