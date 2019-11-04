@@ -81,16 +81,6 @@ class _DeferredTask(defer.Deferred):
                 if not self.__retries:
                     raise
 
-            except AttributeError:
-                # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
-                if not self.__retries:
-                    raise
-
-            except RuntimeError:
-                # builtins.RuntimeError: dictionary changed size during iteration
-                if not self.__retries:
-                    raise
-
 
     def addTimeout(self, timeout, clock, onTimeoutCancel=None):
         defer.Deferred.addTimeout(self, timeout, clock, onTimeoutCancel=onTimeoutCancel)
