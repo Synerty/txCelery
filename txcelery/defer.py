@@ -10,21 +10,18 @@ Module Contents:
 import logging
 import time
 from builtins import ValueError
-from functools import wraps
-from types import MethodType, FunctionType
 
 import celery
 import redis
-import twisted
 from celery import __version__ as celeryVersion
 from celery import states
 from celery.local import PromiseProxy
 from celery.result import AsyncResult
 from celery.worker.control import revoke
 from twisted.internet import defer, reactor
+from twisted.internet.defer import inlineCallbacks
 from twisted.internet.threads import deferToThread
 from twisted.python.failure import Failure
-from twisted.python.threadpool import ThreadPool
 
 isCeleryV4 = celeryVersion.startswith("4.")
 
@@ -43,6 +40,7 @@ class _DeferredTask(defer.Deferred):
     #: Wait Period
     POLL_PERIOD = 0.20
     WAIT_TIMEOUT = 1.000
+    MAX_RETRIES = 3
 
     _ReactorShuttingDown = False
 
@@ -59,14 +57,40 @@ class _DeferredTask(defer.Deferred):
             _DeferredTask will callback or errback, respectively.
         """
         # Deferred is an old-style class
-        defer.Deferred.__init__(self, _DeferredTask._canceller)
+        defer.Deferred.__init__(self, self._canceller)
         self.addErrback(self._cbErrback)
 
+        self.__retries = self.MAX_RETRIES
         self.__timeoutPeriod = self.WAIT_TIMEOUT
         self.__taskId = None
 
-        d = deferToThread(self._run, func, *args, **kwargs)
+        d = self._start(func, *args, **kwargs)
         d.addBoth(self._threadFinishInMain)
+
+    @inlineCallbacks
+    def _start(self, func, *args, **kwargs):
+        while self.__retries and not self.called and not self._ReactorShuttingDown:
+            self.__retries -= 1
+            try:
+                result = yield deferToThread(self._run, func, *args, **kwargs)
+                return result
+
+            except redis.exceptions.ConnectionError:
+                # redis.exceptions.ConnectionError:
+                # Error 32 while writing to socket. Broken pipe.
+                if not self.__retries:
+                    raise
+
+            except AttributeError:
+                # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
+                if not self.__retries:
+                    raise
+
+            except RuntimeError:
+                # builtins.RuntimeError: dictionary changed size during iteration
+                if not self.__retries:
+                    raise
+
 
     def addTimeout(self, timeout, clock, onTimeoutCancel=None):
         defer.Deferred.addTimeout(self, timeout, clock, onTimeoutCancel=onTimeoutCancel)
@@ -77,15 +101,18 @@ class _DeferredTask(defer.Deferred):
             return
 
         if isinstance(result, Failure):
+            if result.check(redis.exceptions.ConnectionError) and self.__retries:
+                self.__retries -= 1
+
             self.errback(result)
 
         else:
             self.callback(result)
 
     def _canceller(self, *args):
-        if self.__taskId is None:
+        if self.__taskId is None or self.__taskState is None:
             return
-        revoke(self.__taskId, terminate=True)
+        AsyncResult(self.__taskId).revoke(terminate=True)
 
     def _cbErrback(self, failure: Failure) -> Failure:
         if isinstance(failure.value, TimeoutError):
@@ -94,12 +121,6 @@ class _DeferredTask(defer.Deferred):
         return failure
 
     def _run(self, func, *args, **kwargs):
-        async_result = func.delay(*args, **kwargs)
-        self.__taskId = async_result.id
-
-        if isinstance(async_result, PromiseProxy):
-            raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
-
         """ Monitor Task In Thread
 
         The Celery task state must be checked in a thread, otherwise it blocks.
@@ -109,92 +130,40 @@ class _DeferredTask(defer.Deferred):
 
         """
         try:
-            # Async task comes up with lots of celery errors :-|
-            # return self._wait_for_task(async_result)
-            return self._poll_for_task(async_result)
+            async_result = func.delay(*args, **kwargs)
+            self.__taskId = async_result.id
+
+            if isinstance(async_result, PromiseProxy):
+                raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
+
+            while not self.called and not self._ReactorShuttingDown:
+                state = async_result.state
+
+                result = None
+                if state not in states.UNREADY_STATES:
+                    result = async_result.result
+
+                # Ignore connection errors, it will retry on the next loop
+
+                if state in states.UNREADY_STATES:
+                    pass
+
+                elif state == 'SUCCESS':
+                    return result
+
+                elif state == 'FAILURE':
+                    raise result
+
+                elif state == 'REVOKED':
+                    raise defer.CancelledError('Task %s' % self.__taskId)
+
+                else:
+                    raise ValueError('Cannot respond to `%s` state' % state)
+
+                time.sleep(self.POLL_PERIOD)
 
         finally:
             async_result.forget()
-
-    def _wait_for_task(self, async_result):
-        while not self.called and not self._ReactorShuttingDown:
-            try:
-                return async_result.wait(timeout=self.__timeoutPeriod)
-
-            except celery.exceptions.TimeoutError:
-                continue
-
-            except redis.exceptions.ConnectionError:
-                # redis.exceptions.ConnectionError:
-                # Error 32 while writing to socket. Broken pipe.
-                continue
-
-            except redis.exceptions.TimeoutError:
-                # redis.exceptions.TimeoutError:
-                # Timeout reading from socket
-                continue
-
-            except AttributeError:
-                # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
-                continue
-
-            except RuntimeError:
-                # builtins.RuntimeError: dictionary changed size during iteration
-                continue
-
-            except Exception as e:
-                logger.exception(e)
-                continue
-
-    def _poll_for_task(self, async_result):
-        """ Monitor Task In Thread
-
-        The Celery task state must be checked in a thread, otherwise it blocks.
-
-        This may stuff with Celerys connection to the result backend.
-        I'm not sure how it manages that.
-
-        """
-
-        while not self.called and not self._ReactorShuttingDown:
-            try:
-                state = async_result.state
-
-                if state in states.UNREADY_STATES:
-                    continue
-
-                result = async_result.result
-                # Ignore connection errors, it will retry on the next loop
-
-            except redis.exceptions.ConnectionError:
-                # redis.exceptions.ConnectionError:
-                # Error 32 while writing to socket. Broken pipe.
-                return False, None
-
-            except AttributeError:
-                # builtins.AttributeError: 'NoneType' object has no attribute 'sendall'
-                return False, None
-
-            except RuntimeError:
-                # builtins.RuntimeError: dictionary changed size during iteration
-                return False, None
-
-            if state in states.UNREADY_STATES:
-                pass
-
-            elif state == 'SUCCESS':
-                return result
-
-            elif state == 'FAILURE':
-                raise result
-
-            elif state == 'REVOKED':
-                raise defer.CancelledError('Task %s' % self.__taskId)
-
-            else:
-                raise ValueError('Cannot respond to `%s` state' % state)
-
-            time.sleep(self.POLL_PERIOD)
 
 
 class DeferrableTask:
