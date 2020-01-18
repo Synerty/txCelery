@@ -119,6 +119,7 @@ class _DeferredTask(defer.Deferred):
         I'm not sure how it manages that.
 
         """
+        async_result = None
         try:
             async_result = func.delay(*args, **kwargs)
             self.__taskId = async_result.id
@@ -153,7 +154,8 @@ class _DeferredTask(defer.Deferred):
                 time.sleep(self.POLL_PERIOD)
 
         finally:
-            async_result.forget()
+            if async_result:
+                async_result.forget()
 
 
 class DeferrableTask:
