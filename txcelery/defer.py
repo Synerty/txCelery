@@ -8,19 +8,17 @@ Module Contents:
     - CeleryClient
 """
 import logging
-import time
+import threading
 from builtins import ValueError
 
-import celery
 import redis
-from celery import __version__ as celeryVersion
-from celery import states
+from celery import __version__ as celeryVersion, Task, Celery
+from celery.backends.redis import RedisBackend
 from celery.local import PromiseProxy
-from celery.result import AsyncResult
-from celery.worker.control import revoke
+from kombu import Connection
 from twisted.internet import defer, reactor
 from twisted.internet.defer import inlineCallbacks
-from twisted.internet.threads import deferToThread
+from twisted.internet.threads import deferToThreadPool
 from twisted.python.failure import Failure
 
 isCeleryV4 = celeryVersion.startswith("4.")
@@ -38,15 +36,41 @@ class _DeferredTask(defer.Deferred):
     """
 
     #: Wait Period
-    POLL_PERIOD = 0.20
-    WAIT_TIMEOUT = 1.000
     MAX_RETRIES = 3
 
-    _ReactorShuttingDown = False
+    __reactorShuttingDown = False
+    __threadPool = None
+
+    _ampqConns = {}
+    _redisConns = {}
+
+    @classmethod
+    def startCeleryThreads(cls, threadCount=50):
+        from twisted.python import threadpool
+        cls.__threadPool = threadpool.ThreadPool(threadCount, threadCount,
+                                                 name="txcelery")
+
+        reactor.addSystemEventTrigger(
+            "before", "shutdown", cls.setReactorShuttingDown
+        )
+
+        cls.__threadPool.start()
+
+        # Patch the Task.AsyncResult method.
+        # So that it uses the redis backend for this thread.
+        Task.AsyncResult = cls._patchAsyncResult
 
     @classmethod
     def setReactorShuttingDown(cls):
-        cls._ReactorShuttingDown = True
+        cls.__reactorShuttingDown = True
+
+        if cls.__threadPool:
+            cls.__threadPool.stop()
+            cls.__threadPool = None
+
+        while cls._ampqConns:
+            conn = cls._ampqConns.popitem()[1]
+            conn.close()
 
     def __init__(self, func, *args, **kwargs):
         """Instantiate a `_DeferredTask`.  See `help(_DeferredTask)` for details
@@ -60,19 +84,59 @@ class _DeferredTask(defer.Deferred):
         defer.Deferred.__init__(self, self._canceller)
         self.addErrback(self._cbErrback)
 
+        # Auto initialise the the thread pool if the app hasn't already done so
+        if not self.__threadPool:
+            logger.debug("Auto initialising txcelery with 50 threads")
+            self.startCeleryThreads()
+
         self.__retries = self.MAX_RETRIES
-        self.__timeoutPeriod = self.WAIT_TIMEOUT
-        self.__taskId = None
+        self.__taskFinished = None
+        self.__asyncResult = None
 
         d = self._start(func, *args, **kwargs)
         d.addBoth(self._threadFinishInMain)
 
+    @classmethod
+    def _getAmpqConn(cls, task: Task):
+        threadId = threading.get_ident()
+        if threadId in cls._ampqConns:
+            return cls._ampqConns[threadId]
+
+        cls._ampqConns[threadId] = Connection(task.app.conf["broker_url"])
+        return cls._ampqConns[threadId]
+
+    @classmethod
+    def _getRedisConn(cls, app: Celery):
+        threadId = threading.get_ident()
+        if threadId in cls._redisConns:
+            return cls._redisConns[threadId]
+
+        cls._redisConns[threadId] = RedisBackend(
+            max_connection=1,
+            url=app.conf["result_backend"],
+            app=app
+        )
+        return cls._redisConns[threadId]
+
+    def _patchAsyncResult(self, task_id, **kwargs):
+        """ Patch the celery task AsyncResult method
+        celery.app.task.py
+        Task.AsyncResult
+        (line 782)
+        """
+        app = self._get_app()
+        return app.AsyncResult(task_id,
+                               backend=_DeferredTask._getRedisConn(app),
+                               task_name=self.name, **kwargs)
+
     @inlineCallbacks
     def _start(self, func, *args, **kwargs):
-        while self.__retries and not self.called and not self._ReactorShuttingDown:
+        while self.__threadPool and self.__retries \
+                and not self.called and not self.__reactorShuttingDown:
             self.__retries -= 1
             try:
-                result = yield deferToThread(self._run, func, *args, **kwargs)
+                result = yield deferToThreadPool(reactor, self.__threadPool,
+                                                 self._run, func, *args, **kwargs)
                 return result
 
             except redis.exceptions.ConnectionError:
@@ -81,10 +145,15 @@ class _DeferredTask(defer.Deferred):
                 if not self.__retries:
                     raise
 
+            except Exception as e:
+
+                print(e.__class__.__name__)
+                print(e)
+                if not self.__retries:
+                    raise
 
     def addTimeout(self, timeout, clock, onTimeoutCancel=None):
         defer.Deferred.addTimeout(self, timeout, clock, onTimeoutCancel=onTimeoutCancel)
-        self.__timeoutPeriod = max(1, timeout - 2)
 
     def _threadFinishInMain(self, result):
         if self.called:
@@ -100,9 +169,9 @@ class _DeferredTask(defer.Deferred):
             self.callback(result)
 
     def _canceller(self, *args):
-        if self.__taskId is None or self.__taskState is None:
+        if self.__asyncResult is None or self.__taskFinished is None:
             return
-        AsyncResult(self.__taskId).revoke(terminate=True)
+        self.__asyncResult.revoke(terminate=True)
 
     def _cbErrback(self, failure: Failure) -> Failure:
         if isinstance(failure.value, TimeoutError):
@@ -119,43 +188,37 @@ class _DeferredTask(defer.Deferred):
         I'm not sure how it manages that.
 
         """
-        async_result = None
-        try:
-            async_result = func.delay(*args, **kwargs)
-            self.__taskId = async_result.id
 
-            if isinstance(async_result, PromiseProxy):
+        try:
+            self.__asyncResult = func.apply_async(args=args, kwargs=kwargs,
+                                                  connection=self._getAmpqConn(func))
+
+            if isinstance(self.__asyncResult, PromiseProxy):
                 raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
 
-            while not self.called and not self._ReactorShuttingDown:
-                state = async_result.state
+            if self.called or self.__reactorShuttingDown:
+                return
 
-                result = None
-                if state not in states.UNREADY_STATES:
-                    result = async_result.result
+            self.__asyncResult.get()
+            self.__taskFinished = True
+            state = self.__asyncResult.state
+            result = self.__asyncResult.result
 
-                # Ignore connection errors, it will retry on the next loop
+            if state == 'SUCCESS':
+                return result
 
-                if state in states.UNREADY_STATES:
-                    pass
+            elif state == 'FAILURE':
+                raise result
 
-                elif state == 'SUCCESS':
-                    return result
+            elif state == 'REVOKED':
+                raise defer.CancelledError('Task %s' % self.__asyncResult.id)
 
-                elif state == 'FAILURE':
-                    raise result
-
-                elif state == 'REVOKED':
-                    raise defer.CancelledError('Task %s' % self.__taskId)
-
-                else:
-                    raise ValueError('Cannot respond to `%s` state' % state)
-
-                time.sleep(self.POLL_PERIOD)
+            else:
+                raise ValueError('Cannot respond to `%s` state' % state)
 
         finally:
-            if async_result:
-                async_result.forget()
+            if self.__asyncResult:
+                self.__asyncResult.forget()
 
 
 class DeferrableTask:
