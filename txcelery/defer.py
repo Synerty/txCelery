@@ -10,6 +10,8 @@ Module Contents:
 import logging
 import threading
 from builtins import ValueError
+from datetime import datetime
+from typing import Any, Dict
 
 import redis
 from celery import __version__ as celeryVersion, Task, Celery
@@ -24,6 +26,83 @@ from twisted.python.failure import Failure
 isCeleryV4 = celeryVersion.startswith("4.")
 
 logger = logging.getLogger(__name__)
+
+"""
+DEBUGGING NOTES
+
+watch "redis-cli client list | sed 's/idle=/idle /g;s/age=/age /g' | sort -r -n -k6 "
+
+watch -n 0.1 "echo -n 'Redis: '; redis-cli client list | wc -l; echo -n 'RabbitMQ: '; netstat -an | grep 5672 | wc -l"
+
+INSERT INTO pl_diagram."DispCompilerQueue" ("dispId")
+SELECT id FROM pl_diagram."DispBase";
+
+"""
+
+class _ThreadConnection:
+    MAX_CONN_PERIOD_SECONDS = 120.0
+
+    def __init__(self, app: Celery):
+
+        self._threadId = threading.get_ident()
+        self._app = app
+        self._brokerUrl = app.conf["broker_url"]
+        self._resultBackendUrl = app.conf["result_backend"]
+
+        self._ampqConn = None
+        self._redisConn = None
+        self._connectedSince = None
+
+    def _connectRedis(self):
+        self._redisConn = RedisBackend(
+            max_connection=1,
+            url=self._resultBackendUrl,
+            app=self._app
+        )
+
+    def _connectAmpq(self):
+        self._ampqConn = Connection(self._brokerUrl)
+
+    def initialise(self):
+        if self._connectedSince:
+            return
+        self._connectedSince = datetime.utcnow()
+        self._connectAmpq()
+        self._connectRedis()
+
+    def cleanup(self):
+        if not self._connectedSince:
+            return
+
+        currentConnSeconds = (datetime.utcnow() - self._connectedSince).seconds
+        if self.MAX_CONN_PERIOD_SECONDS < currentConnSeconds:
+            logger.debug("Closing connections for thread %s", self._threadId)
+            self.shutdown()
+
+    @property
+    def ampqConn(self):
+        assert self._threadId == threading.get_ident(), "AmpQ conn is not for this thread"
+        return self._ampqConn
+
+    @property
+    def redisConn(self):
+        assert self._threadId == threading.get_ident(), \
+            "Redis conn is not for this thread"
+
+        return self._redisConn
+
+    def shutdown(self):
+        if self._ampqConn:
+            self._ampqConn.close()
+            self._ampqConn = None
+
+        if self._redisConn:
+            client = self._redisConn.client
+            client.pubsub().close()
+            client.connection_pool.disconnect()
+            self._redisConn = None
+
+        self._connectedSince = None
 
 
 class _DeferredTask(defer.Deferred):
@@ -41,8 +120,7 @@ class _DeferredTask(defer.Deferred):
     __reactorShuttingDown = False
     __threadPool = None
 
-    _ampqConns = {}
-    _redisConns = {}
+    _threadConns: Dict[Any, _ThreadConnection] = {}
 
     @classmethod
     def startCeleryThreads(cls, threadCount=50):
@@ -60,6 +138,9 @@ class _DeferredTask(defer.Deferred):
         # So that it uses the redis backend for this thread.
         Task.AsyncResult = cls._patchAsyncResult
 
+        # Start the cleanup loop
+        reactor.callLater(1.0, cls._scheduleCheckThreadConnCleanup)
+
     @classmethod
     def setReactorShuttingDown(cls):
         cls.__reactorShuttingDown = True
@@ -68,9 +149,9 @@ class _DeferredTask(defer.Deferred):
             cls.__threadPool.stop()
             cls.__threadPool = None
 
-        while cls._ampqConns:
-            conn = cls._ampqConns.popitem()[1]
-            conn.close()
+        while cls._threadConns:
+            threadConn = cls._threadConns.popitem()[1]
+            threadConn.shutdown()
 
     def __init__(self, func, *args, **kwargs):
         """Instantiate a `_DeferredTask`.  See `help(_DeferredTask)` for details
@@ -97,26 +178,48 @@ class _DeferredTask(defer.Deferred):
         d.addBoth(self._threadFinishInMain)
 
     @classmethod
-    def _getAmpqConn(cls, task: Task):
+    def _getThreadConns(cls, app: Celery):
         threadId = threading.get_ident()
-        if threadId in cls._ampqConns:
-            return cls._ampqConns[threadId]
+        threadConn = cls._threadConns.get(threadId)
 
-        cls._ampqConns[threadId] = Connection(task.app.conf["broker_url"])
-        return cls._ampqConns[threadId]
+        if not threadConn:
+            threadConn = _ThreadConnection(app)
+            cls._threadConns[threadId] = threadConn
+
+        threadConn.initialise()
+        return threadConn
 
     @classmethod
-    def _getRedisConn(cls, app: Celery):
-        threadId = threading.get_ident()
-        if threadId in cls._redisConns:
-            return cls._redisConns[threadId]
+    def _scheduleCheckThreadConnCleanup(cls):
+        if not cls.__threadPool or cls.__reactorShuttingDown:
+            return
 
-        cls._redisConns[threadId] = RedisBackend(
-            max_connection=1,
-            url=app.conf["result_backend"],
-            app=app
-        )
-        return cls._redisConns[threadId]
+        def err(failure):
+            logger.exception(failure.value)
+
+        for _ in range(cls.__threadPool.workers):
+            d = deferToThreadPool(reactor, cls.__threadPool,
+                                  cls._checkThreadConnCleanup)
+            d.addErrback(err)
+
+        reactor.callLater(60.0, cls._scheduleCheckThreadConnCleanup)
+
+    @classmethod
+    def _checkThreadConnCleanup(cls):
+        """ Check Thread Connection Cleanup
+
+        This method is periodically run to cleanup any connections that have not
+        been used in a while.
+
+        This method is run in the threadpool, so it will ensure that the running thread
+        is not using the connection, simply because if it were, this method couldn't
+        be run in this thread.
+
+        """
+        threadId = threading.get_ident()
+        threadConn = cls._threadConns.get(threadId)
+        if threadConn:
+            threadConn.cleanup()
 
     def _patchAsyncResult(self, task_id, **kwargs):
         """ Patch the celery task AsyncResult method
@@ -125,8 +228,9 @@ class _DeferredTask(defer.Deferred):
         (line 782)
         """
         app = self._get_app()
+        threadConn = _DeferredTask._getThreadConns(app)
         return app.AsyncResult(task_id,
-                               backend=_DeferredTask._getRedisConn(app),
+                               backend=threadConn.redisConn,
                                task_name=self.name, **kwargs)
 
     @inlineCallbacks
@@ -188,10 +292,11 @@ class _DeferredTask(defer.Deferred):
         I'm not sure how it manages that.
 
         """
+        threadConn = self._getThreadConns(func.app)
 
         try:
             self.__asyncResult = func.apply_async(args=args, kwargs=kwargs,
-                                                  connection=self._getAmpqConn(func))
+                                                  connection=threadConn.ampqConn)
 
             if isinstance(self.__asyncResult, PromiseProxy):
                 raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
@@ -219,6 +324,7 @@ class _DeferredTask(defer.Deferred):
         finally:
             if self.__asyncResult:
                 self.__asyncResult.forget()
+            threadConn.cleanup()
 
 
 class DeferrableTask:
