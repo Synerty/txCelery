@@ -11,6 +11,7 @@ import logging
 import threading
 from builtins import ValueError
 from datetime import datetime
+from random import random
 from typing import Any, Dict
 
 import redis
@@ -40,8 +41,9 @@ SELECT id FROM pl_diagram."DispBase";
 
 """
 
+
 class _ThreadConnection:
-    MAX_CONN_PERIOD_SECONDS = 120.0
+    MAX_CONN_PERIOD_SECONDS: int = None
 
     def __init__(self, app: Celery):
 
@@ -53,6 +55,7 @@ class _ThreadConnection:
         self._ampqConn = None
         self._redisConn = None
         self._connectedSince = None
+        self._connectionMaxSeconds = None
 
     def _connectRedis(self):
         self._redisConn = RedisBackend(
@@ -71,12 +74,18 @@ class _ThreadConnection:
         self._connectAmpq()
         self._connectRedis()
 
+        # Add some salt to the number so that we don't end up reconnecting the whole
+        # pool all at once.
+        # This will be +/- 10 seconds
+        self._connectionMaxSeconds = int((random() - 0.5) * 20.0) \
+                                     + self.MAX_CONN_PERIOD_SECONDS
+
     def cleanup(self):
         if not self._connectedSince:
             return
 
         currentConnSeconds = (datetime.utcnow() - self._connectedSince).seconds
-        if self.MAX_CONN_PERIOD_SECONDS < currentConnSeconds:
+        if self._connectionMaxSeconds < currentConnSeconds:
             logger.debug("Closing connections for thread %s", self._threadId)
             self.shutdown()
 
@@ -104,6 +113,7 @@ class _ThreadConnection:
             self._redisConn = None
 
         self._connectedSince = None
+        self._connectionMaxSeconds = None
 
 
 class _DeferredTask(defer.Deferred):
@@ -124,7 +134,21 @@ class _DeferredTask(defer.Deferred):
     _threadConns: Dict[Any, _ThreadConnection] = {}
 
     @classmethod
-    def startCeleryThreads(cls, threadCount=50):
+    def startCeleryThreads(cls, threadCount=50, maxConnectionTime=120.0):
+        """ Start Celery Threads
+
+        Configure the Celery connection settings.
+
+        :param threadCount: This is the size of the threadpool used to send to
+            the celery worker
+            and receive the results back from the celery worker.
+
+        :param maxConnectionTime: This it the maximum time a connection will be used
+            for before it's closed and a new one is opened.
+
+        """
+        _ThreadConnection.MAX_CONN_PERIOD_SECONDS = maxConnectionTime
+
         from twisted.python import threadpool
         cls.__threadPool = threadpool.ThreadPool(threadCount, threadCount,
                                                  name="txcelery")
