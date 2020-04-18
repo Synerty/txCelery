@@ -16,6 +16,7 @@ from typing import Any, Dict
 import redis
 from celery import __version__ as celeryVersion, Task, Celery
 from celery.backends.redis import RedisBackend
+from celery.exceptions import TimeoutError
 from celery.local import PromiseProxy
 from kombu import Connection
 from twisted.internet import defer, reactor
@@ -301,10 +302,19 @@ class _DeferredTask(defer.Deferred):
             if isinstance(self.__asyncResult, PromiseProxy):
                 raise TypeError('Decorate with "DeferrableTask, not "_DeferredTask".')
 
-            if self.called or self.__reactorShuttingDown:
-                return
+            while True:
+                if self.called or self.__reactorShuttingDown:
+                    return
 
-            self.__asyncResult.get()
+                try:
+                    # We need to add a timeout here, otherwise the caller service
+                    # can never shutdown while it's wiating for a task to complete
+                    self.__asyncResult.get(timeout=5.0)
+                    break
+
+                except TimeoutError:
+                    continue
+
             self.__taskFinished = True
             state = self.__asyncResult.state
             result = self.__asyncResult.result
