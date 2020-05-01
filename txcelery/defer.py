@@ -162,6 +162,7 @@ class _DeferredTask(defer.Deferred):
         # Patch the Task.AsyncResult method.
         # So that it uses the redis backend for this thread.
         Task.AsyncResult = cls._patchAsyncResult
+        Celery.backend = cls._pathCeleryBackendProperty
 
         # Start the cleanup loop
         reactor.callLater(1.0, cls._scheduleCheckThreadConnCleanup)
@@ -245,6 +246,17 @@ class _DeferredTask(defer.Deferred):
         threadConn = cls._threadConns.get(threadId)
         if threadConn:
             threadConn.cleanup()
+
+    @property
+    def _pathCeleryBackendProperty(self):
+        """ Patch the celery app backend method
+        celery.app.base.py
+        Celery.backend
+        (line 1221)
+        """
+        # noinspection PyTypeChecker
+        threadConn = _DeferredTask._getThreadConns(self)
+        return threadConn.redisConn
 
     def _patchAsyncResult(self, task_id, **kwargs):
         """ Patch the celery task AsyncResult method
